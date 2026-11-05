@@ -44,7 +44,18 @@ static bool Focused() {
     return pid == GetCurrentProcessId();
 }
 
+static int g_logCount = 0;
+
+static int ExFilter(unsigned int code) {
+    if (g_logCount < 10) {
+        g_logCount++;
+        Log("OnFire: EXCEPCION 0x%08X", code);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static void ApplyToPlayer(bool toggle, bool &active, bool &oldFireProof) {
+    static DWORD lastTry = 0;
     __try {
         DWORD ped = *(DWORD *)ADDR_PLAYER_PED;
         if (!ped)
@@ -54,6 +65,8 @@ static void ApplyToPlayer(bool toggle, bool &active, bool &oldFireProof) {
 
         if (toggle) {
             active = !active;
+            Log("OnFire: activo=%d, vida=%f, m_pFire=%08X, flags=%02X",
+                (int)active, *(float *)(ped + OFF_HEALTH), *fire, *flags);
             if (active) {
                 oldFireProof = (*flags & FLAG_FIREPROOF) != 0;
             } else {
@@ -62,15 +75,28 @@ static void ApplyToPlayer(bool toggle, bool &active, bool &oldFireProof) {
                 if (!oldFireProof)
                     *flags &= (BYTE)~FLAG_FIREPROOF;
             }
+            lastTry = 0;
         }
 
         if (active && *(float *)(ped + OFF_HEALTH) > 0.0f) {
+            if (!*fire) {
+                DWORD now = GetTickCount();
+                if (now - lastTry > 500) {
+                    lastTry = now;
+                    // Primero quitar la proteccion, si no el juego no enciende el fuego
+                    *flags &= (BYTE)~FLAG_FIREPROOF;
+                    void *r = ((StartFire_t)ADDR_START_FIRE)((void *)ADDR_FIRE_MANAGER, (void *)ped,
+                                                              nullptr, 0.8f, 1, 7000, 100);
+                    if (g_logCount < 10) {
+                        g_logCount++;
+                        Log("OnFire: StartFire devolvio %p, m_pFire=%08X", r, *fire);
+                    }
+                }
+            }
+            // Despues activar la proteccion contra el fuego
             *flags |= FLAG_FIREPROOF;
-            if (!*fire)
-                ((StartFire_t)ADDR_START_FIRE)((void *)ADDR_FIRE_MANAGER, (void *)ped, nullptr,
-                                               0.8f, 1, 7000, 100);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (ExFilter(GetExceptionCode())) {
     }
 }
 
@@ -112,9 +138,6 @@ static DWORD WINAPI Worker(LPVOID) {
         if (typed.size() >= 6 && typed.compare(typed.size() - 6, 6, "ONFIRE") == 0) {
             typed.clear();
             toggle = true;
-            DWORD ped = 0;
-            bool ok = ReadDword(ADDR_PLAYER_PED, ped);
-            Log("OnFire: ONFIRE detectado, jugador=%08X (leido=%d)", ped, ok);
         }
 
         ApplyToPlayer(toggle, active, oldFireProof);
