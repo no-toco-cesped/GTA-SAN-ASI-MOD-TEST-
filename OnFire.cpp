@@ -1,10 +1,14 @@
-// OnFire.asi v3 - GTA San Andreas 1.0 US
+// OnFire.asi v4 - GTA San Andreas 1.0 US
 // Teclea ONFIRE para activar / desactivar TODO el modo:
 //   - CJ cubierto por una llama grande, inmune al fuego y a las explosiones
 //   - Regeneracion leve de vida
 //   - Jetpack REAL del juego (sin la mochila visible) con llamas de impulso en los pies
 //   - Lanzallamas con mira (boton derecho apunta, izquierdo dispara) y municion infinita
 //   - Los NPC que pisen llamas o toquen a CJ unos segundos se prenden fuego
+//   - La tecla F (bajar del jetpack) queda bloqueada mientras el modo esta activo
+//   - El fuego del lanzallamas empuja NPC, autos y objetos que se puedan mover
+//   - Las llamas del suelo se apagan rapido (menos lag)
+//   - EXPERIMENTAL: lanzallamas con animacion de pistolas dobles y arma invisible
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -19,7 +23,13 @@ static const bool  HIDE_BACKPACK       = true;   // ocultar la mochila del jetpa
 static const bool  ENABLE_FEET_FLAMES  = true;   // llamas extra en los pies al volar
 static const bool  ENABLE_FLAMETHROWER = true;   // lanzallamas real con mira
 static const bool  ENABLE_BIG_FLAME    = true;   // llama grande sobre CJ
+static const bool  ENABLE_PUSH         = true;   // el fuego empuja entidades
+static const bool  FAST_FLAME_DECAY    = true;   // apagar rapido las llamas del suelo
+static const bool  ENABLE_PISTOL_ANIM  = true;   // EXPERIMENTAL: animacion de pistolas dobles
+static const bool  HIDE_WEAPON_MODEL   = true;   // EXPERIMENTAL: arma en mano invisible
 static const float BIG_FLAME_STRENGTH  = 3.0f;
+static const DWORD FLAME_LIFETIME_MS   = 600;    // vida maxima de las llamas del suelo
+static const float PUSH_RANGE          = 11.0f;  // alcance del empujon (metros)
 static const float REGEN_PER_TICK      = 0.6f;   // vida cada 250 ms (~2.4 por segundo)
 
 // ---------- Direcciones GTA SA 1.0 ----------
@@ -40,6 +50,11 @@ static const DWORD ADDR_CLEAR_WEAPON   = 0x5E62B0;
 static const DWORD ADDR_REQUEST_MODEL  = 0x4087E0;
 static const DWORD ADDR_LOAD_MODELS    = 0x40EA10;
 static const DWORD ADDR_CLUMP_ATOMICS  = 0x749B70;  // RpClumpForAllAtomics
+static const DWORD ADDR_GET_PAD        = 0x53FB70;  // CPad::GetPad(int)
+static const DWORD ADDR_GET_WEAPONINFO = 0x743C60;  // CWeaponInfo::GetWeaponInfo(type, skill)
+static const DWORD ADDR_GAME_TIME      = 0xB7CB84;  // CTimer::m_snTimeInMilliseconds
+static const DWORD ADDR_VEHICLE_POOL   = 0xB74494;
+static const DWORD ADDR_OBJECT_POOL    = 0xB7449C;
 
 // ---------- Offsets ----------
 static const DWORD OFF_MATRIX       = 0x14;
@@ -51,10 +66,14 @@ static const DWORD OFF_HEALTH       = 0x540;
 static const DWORD OFF_MAXHEALTH    = 0x544;
 static const DWORD OFF_WEAPONS      = 0x5A0;   // CWeapon[13], 0x1C cada uno
 static const DWORD OFF_VEHICLE      = 0x58C;
+static const DWORD OFF_WEAPON_OBJ   = 0x4F4;   // CPed::m_pWeaponObject
+static const DWORD OFF_CUR_SLOT     = 0x718;   // CPed::m_nSelectedWepSlot
 static const DWORD OFF_FIRE         = 0x730;
 static const BYTE  PROOF_BITS       = 0x08 | 0x80;
 static const BYTE  FLAG_FIREPROOF   = 0x08;
 static const int   PED_STRIDE       = 0x7C4;
+static const int   VEHICLE_STRIDE   = 0xA18;
+static const int   OBJECT_STRIDE    = 0x19C;
 static const int   WEAPON_FLAMETHROWER = 37;
 static const int   MODEL_FLAMETHROWER  = 361;
 static const int   SLOT_FLAMETHROWER   = 7;
@@ -75,6 +94,10 @@ static BYTE g_oldProofBits = 0;
 static bool g_hadFlamethrower = false;
 static bool g_wasDead = false;
 static DWORD g_nextFireTry = 0, g_nextThrust = 0, g_nextScan = 0, g_nextRegen = 0, g_nextAmmo = 0;
+static DWORD g_nextJetTry = 0, g_nextDecay = 0;
+static int g_jetLogCount = 0;
+static bool g_animSaved = false;
+static DWORD g_savedAnim[9];   // flags, animToPlay, 6 campos de bucle, breakout
 static DWORD g_contact[1024];
 static int g_logCount = 0;
 static bool g_useThreadFrame = false;
@@ -178,9 +201,8 @@ static void GiveJetpack(DWORD ped) {
         return;                                  // dentro de un vehiculo
     if (GetJetpackTask(ped))
         return;                                  // ya tiene jetpack
-    Log("OnFire: [paso] activando el jetpack");
+    if (g_jetLogCount < 6) { g_jetLogCount++; Log("OnFire: [paso] activando el jetpack"); }
     ((void(__cdecl *)())ADDR_JETPACK_CHEAT)();
-    Log("OnFire: [ok] jetpack listo");
 }
 
 static void *__cdecl HideAtomicCb(void *atomic, void *) {
@@ -193,6 +215,135 @@ static void HideBackpack(DWORD task) {
     if (clump)
         ((void *(__cdecl *)(void *, void *(__cdecl *)(void *, void *), void *))ADDR_CLUMP_ATOMICS)(
             (void *)clump, HideAtomicCb, nullptr);
+}
+
+
+// ---------- Animacion de pistolas dobles para el lanzallamas (EXPERIMENTAL) ----------
+static DWORD *FlameInfo() {
+    return (DWORD *)((void *(__cdecl *)(int, unsigned char))ADDR_GET_WEAPONINFO)(WEAPON_FLAMETHROWER, 1);
+}
+
+static void ApplyPistolAnim() {
+    DWORD *fi = FlameInfo();
+    DWORD *pi = (DWORD *)((void *(__cdecl *)(int, unsigned char))ADDR_GET_WEAPONINFO)(22, 2);  // pistola, skill PRO
+    if (!fi || !pi || fi == pi)
+        return;
+    if (!g_animSaved) {
+        g_savedAnim[0] = fi[0x18 / 4];
+        g_savedAnim[1] = fi[0x1C / 4];
+        for (int i = 0; i < 6; i++)
+            g_savedAnim[2 + i] = fi[(0x40 + i * 4) / 4];
+        g_savedAnim[8] = fi[0x58 / 4];
+        g_animSaved = true;
+    }
+    Log("OnFire: [paso] copiando animacion de pistolas dobles al lanzallamas");
+    fi[0x1C / 4] = pi[0x1C / 4];                        // grupo de animacion
+    for (int i = 0; i < 6; i++)
+        fi[(0x40 + i * 4) / 4] = pi[(0x40 + i * 4) / 4]; // tiempos del bucle de animacion
+    fi[0x58 / 4] = pi[0x58 / 4];                        // breakout
+    fi[0x18 / 4] |= 0x800;                              // bTwinPistol
+    Log("OnFire: [ok] animacion aplicada");
+}
+
+static void RestorePistolAnim() {
+    if (!g_animSaved)
+        return;
+    DWORD *fi = FlameInfo();
+    if (!fi)
+        return;
+    fi[0x18 / 4] = g_savedAnim[0];
+    fi[0x1C / 4] = g_savedAnim[1];
+    for (int i = 0; i < 6; i++)
+        fi[(0x40 + i * 4) / 4] = g_savedAnim[2 + i];
+    fi[0x58 / 4] = g_savedAnim[8];
+    g_animSaved = false;
+}
+
+// Oculta el arma que CJ lleva en la mano (clump o atomic)
+static void HideWeaponModel(DWORD ped) {
+    DWORD obj = *(DWORD *)(ped + OFF_WEAPON_OBJ);
+    if (!obj)
+        return;
+    BYTE type = *(BYTE *)obj;                    // RwObject::type: 1 = atomic, 2 = clump
+    if (type == 2)
+        ((void *(__cdecl *)(void *, void *(__cdecl *)(void *, void *), void *))ADDR_CLUMP_ATOMICS)(
+            (void *)obj, HideAtomicCb, nullptr);
+    else if (type == 1)
+        HideAtomicCb((void *)obj, nullptr);
+}
+
+// ---------- Empujon del fuego ----------
+static void PushPool(DWORD poolAddr, int stride, DWORD player, const float *pp, float dx, float dy,
+                     float strength, bool isPed) {
+    DWORD pool = *(DWORD *)poolAddr;
+    if (!pool)
+        return;
+    DWORD objs = *(DWORD *)pool;
+    BYTE *map = *(BYTE **)(pool + 4);
+    int size = *(int *)(pool + 8);
+    if (!objs || !map || size <= 0 || size > 2048)
+        return;
+    DWORD playerVeh = *(DWORD *)(player + OFF_VEHICLE);
+
+    for (int i = 0; i < size; i++) {
+        if (map[i] & 0x80)
+            continue;
+        DWORD e = objs + (DWORD)i * stride;
+        if (e == player || e == playerVeh)
+            continue;
+        if (isPed && *(DWORD *)(e + OFF_VEHICLE))
+            continue;                            // peaton dentro de un vehiculo
+
+        float q[3];
+        GetPos(e, q);
+        float vx = q[0] - pp[0], vy = q[1] - pp[1], vz = q[2] - pp[2];
+        if (vz < -4.0f || vz > 4.0f)
+            continue;
+        float dist = sqrtf(vx * vx + vy * vy);
+        if (dist < 0.8f || dist > PUSH_RANGE)
+            continue;
+        if ((vx * dx + vy * dy) / dist < 0.82f)
+            continue;                            // fuera del cono de fuego
+
+        float *ms = (float *)(e + OFF_MOVESPEED);
+        if (ms[0] * dx + ms[1] * dy < 0.45f) {   // limite de velocidad del empujon
+            ms[0] += dx * strength;
+            ms[1] += dy * strength;
+            ms[2] += strength * 0.12f;
+        }
+    }
+}
+
+static void PushFlame(DWORD ped, const float *pp) {
+    DWORD m = *(DWORD *)(ped + OFF_MATRIX);
+    if (!m)
+        return;
+    float *fwd = (float *)(m + 0x10);
+    float len = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1]);
+    if (len < 0.001f)
+        return;
+    float dx = fwd[0] / len, dy = fwd[1] / len;
+    PushPool(ADDR_PED_POOL,     PED_STRIDE,     ped, pp, dx, dy, 0.035f, true);
+    PushPool(ADDR_VEHICLE_POOL, VEHICLE_STRIDE, ped, pp, dx, dy, 0.030f, false);
+    PushPool(ADDR_OBJECT_POOL,  OBJECT_STRIDE,  ped, pp, dx, dy, 0.050f, false);
+}
+
+// Acorta la vida de las llamas del suelo (las de scripts de misiones no se tocan)
+static void DecayFires() {
+    DWORD gameTime = *(DWORD *)ADDR_GAME_TIME;
+    DWORD limit = gameTime + FLAME_LIFETIME_MS;
+    for (int i = 0; i < 60; i++) {
+        BYTE *f = (BYTE *)(ADDR_FIRE_MANAGER + i * 0x28);
+        if (!(f[0] & 1))                         // inactiva
+            continue;
+        if (f[0] & 2)                            // creada por script de mision
+            continue;
+        if (*(DWORD *)(f + 0x10) != 0)           // pegada a una entidad (CJ, NPC, auto)
+            continue;
+        DWORD *expiry = (DWORD *)(f + 0x18);
+        if (*expiry > limit)
+            *expiry = limit;
+    }
 }
 
 // NPC que pisan llamas del suelo, o que tocan a CJ, se prenden fuego
@@ -279,12 +430,15 @@ static void Frame() {
             if (health > 0.0f) {
                 if (ENABLE_FLAMETHROWER) {
                     g_hadFlamethrower = HasFlamethrower(ped);
+                    if (ENABLE_PISTOL_ANIM)
+                        ApplyPistolAnim();
                     GiveFlamethrower(ped);
                 }
                 if (ENABLE_JETPACK)
                     GiveJetpack(ped);
             }
         } else {
+            RestorePistolAnim();
             if (*fire)
                 ((Extinguish_t)ADDR_EXTINGUISH)((void *)*fire);
             if (ENABLE_FLAMETHROWER && !g_hadFlamethrower && HasFlamethrower(ped))
@@ -326,6 +480,13 @@ static void Frame() {
     g_wasDead = dead;
     if (dead)
         return;
+
+    // ----- Si CJ pierde el jetpack (y no esta en un vehiculo), volver a darlo -----
+    if (ENABLE_JETPACK && !*(DWORD *)(ped + OFF_VEHICLE) && !GetJetpackTask(ped) &&
+        (int)(now - g_nextJetTry) >= 0) {
+        g_nextJetTry = now + 400;
+        GiveJetpack(ped);
+    }
 
     // ----- CJ ardiendo con llama grande -----
     if (!*fire && (int)(now - g_nextFireTry) >= 0) {
@@ -370,14 +531,34 @@ static void Frame() {
                 float *ms = (float *)(ped + OFF_MOVESPEED);
                 float speed = sqrtf(ms[0] * ms[0] + ms[1] * ms[1] + ms[2] * ms[2]);
                 if (speed > 0.03f && (int)(now - g_nextThrust) >= 0) {
-                    g_nextThrust = now + 110;
+                    g_nextThrust = now + 150;
                     float hs = sqrtf(ms[0] * ms[0] + ms[1] * ms[1]);
                     float bx = 0, by = 0;
                     if (hs > 0.001f) { bx = -ms[0] / hs * 0.5f; by = -ms[1] / hs * 0.5f; }
-                    FirePoint(pos[0] + bx, pos[1] + by, pos[2] - 1.0f, 450);
+                    FirePoint(pos[0] + bx, pos[1] + by, pos[2] - 1.0f, 250);
                 }
             }
         }
+    }
+
+    // ----- Arma en mano invisible (experimental) -----
+    if (ENABLE_FLAMETHROWER && HIDE_WEAPON_MODEL && HasFlamethrower(ped))
+        HideWeaponModel(ped);
+
+    // ----- Empujon mientras el lanzallamas esta disparando -----
+    if (ENABLE_PUSH && ENABLE_FLAMETHROWER && HasFlamethrower(ped)) {
+        BYTE slot = *(BYTE *)(ped + OFF_CUR_SLOT);
+        if (slot == SLOT_FLAMETHROWER) {
+            DWORD wpn = ped + OFF_WEAPONS + SLOT_FLAMETHROWER * 0x1C;
+            if (*(DWORD *)(wpn + 4) == 1)        // CWeapon::m_nState == FIRING
+                PushFlame(ped, pos);
+        }
+    }
+
+    // ----- Apagar rapido las llamas del suelo -----
+    if (FAST_FLAME_DECAY && (int)(now - g_nextDecay) >= 0) {
+        g_nextDecay = now + 100;
+        DecayFires();
     }
 
     // ----- Contagio a los NPC (10 veces por segundo) -----
@@ -394,7 +575,33 @@ static void OnFrame() {
     }
 }
 
+
+// Antes de que el juego procese al jugador: anula el boton "subir/bajar de vehiculo" (F)
+// mientras CJ lleva el jetpack del modo, para que no se baje.
+static void PrePadWork() {
+    if (!g_active || !ENABLE_JETPACK)
+        return;
+    DWORD ped = *(DWORD *)ADDR_PLAYER_PED;
+    if (!ped || *(DWORD *)(ped + OFF_VEHICLE))
+        return;
+    if (!GetJetpackTask(ped))
+        return;
+    BYTE *pad = (BYTE *)((void *(__cdecl *)(int))ADDR_GET_PAD)(0);
+    if (!pad)
+        return;
+    *(short *)(pad + 0x1E) = 0;                  // NewState.ButtonTriangle
+    *(short *)(pad + 0x30 + 0x1E) = 0;           // OldState.ButtonTriangle
+}
+
+static void PrePad() {
+    __try {
+        PrePadWork();
+    } __except (ExFilter(GetExceptionCode())) {
+    }
+}
+
 static void __cdecl HookedProcess() {
+    PrePad();
     g_origProcess();
     OnFrame();
 }
@@ -448,7 +655,7 @@ static DWORD WINAPI Worker(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        Log("OnFire v3: DLL cargada");
+        Log("OnFire v4: DLL cargada");
 
         DWORD sigUS = 0, sigEU = 0;
         bool okUS = ReadDword(0x82457C, sigUS);
