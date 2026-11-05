@@ -1,0 +1,28 @@
+name: Build ASI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar compilador MSVC de 32 bits
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compilar OnFire.asi
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MT /EHsc /LD OnFire.cpp /Fe:OnFire.asi user32.lib
+          dumpbin /headers OnFire.asi | findstr /i "machine"
+
+      - name: Subir el .asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnFire-asi
+          path: OnFire.asi
